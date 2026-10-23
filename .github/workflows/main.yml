@@ -78,31 +78,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$WORK/toolchain"
+          cd "$WORK/toolchain"
+
+          echo "Fetching AntMan..."
+          curl -fsSL \
+            "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" \
+            -o antman
+          chmod +x antman
 
           if [[ -n "${CLANG_VERSION:-}" ]]; then
-            API="https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/tags/${CLANG_VERSION}"
+            echo "Installing Neutron clang ${CLANG_VERSION} via AntMan..."
+            ./antman -S="${CLANG_VERSION}" --noconfirm --noaxel
           else
-            API="https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest"
+            echo "Installing latest Neutron clang via AntMan..."
+            ./antman -S --noconfirm --noaxel
           fi
 
-          ASSET_URL=$(curl -sSL -H "Accept: application/vnd.github+json" "$API" \
-            | grep -oE '"browser_download_url": *"[^"]+\.tar\.zst"' \
-            | grep -i x86_64 | head -n1 \
-            | sed -E 's/.*"browser_download_url": *"([^"]+)"/\1/')
-
-          if [[ -z "$ASSET_URL" ]]; then
-            echo "::error::Could not resolve a Neutron clang release asset"
-            exit 1
+          # AntMan extracts into ./neutron-clang by default
+          if [[ -x "$WORK/toolchain/neutron-clang/bin/clang" ]]; then
+            CLANG_BIN="$WORK/toolchain/neutron-clang/bin"
+          else
+            CLANG_BIN="$(dirname "$(find "$WORK/toolchain" -maxdepth 5 -name clang -print -quit)")"
           fi
 
-          wget -q --show-progress "$ASSET_URL" -O "$WORK/toolchain/neutron.tar.zst"
-          zstd -d --quiet "$WORK/toolchain/neutron.tar.zst" -o "$WORK/toolchain/neutron.tar"
-          tar -xf "$WORK/toolchain/neutron.tar" -C "$WORK/toolchain"
-          rm -f "$WORK/toolchain/neutron.tar.zst" "$WORK/toolchain/neutron.tar"
-
-          CLANG_BIN="$(dirname "$(find "$WORK/toolchain" -maxdepth 5 -name clang -print -quit)")"
-          if [[ -z "$CLANG_BIN" || ! -e "$CLANG_BIN/clang" ]]; then
-            echo "::error::Neutron clang binary not found after extraction"
+          if [[ -z "${CLANG_BIN:-}" || ! -e "$CLANG_BIN/clang" ]]; then
+            echo "::error::Neutron clang binary not found after AntMan install"
+            find "$WORK/toolchain" -maxdepth 4 | head -40
             exit 1
           fi
           echo "Neutron clang bin: $CLANG_BIN"
