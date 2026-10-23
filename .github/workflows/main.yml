@@ -42,7 +42,7 @@ jobs:
     env:
       KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sm8635
       # CHANGED: Use the pre-patched modules repository
-      MODULES_REPO: https://github.com/Raju-yeager/android_kernel_xiaomi_sm8635-modules
+      MODULES_REPO: https://github.com/redzrush101/android_kernel_xiaomi_sm8635-modules
       KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
       MODULES_BRANCH: ${{ inputs.modules_branch || 'lineage-23.2' }}
       CLANG_VERSION: ${{ inputs.clang_version || '' }}
