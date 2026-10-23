@@ -68,8 +68,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update -o Acquire::Languages=none
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get update 
+          sudo apt-get install -y \
             bc bison flex build-essential libssl-dev libelf-dev dwarves cpio lz4 zstd \
             kmod rsync python3 ccache git patch curl \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
