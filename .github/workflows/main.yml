@@ -41,7 +41,6 @@ jobs:
     timeout-minutes: 350
     env:
       KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sm8635
-      # CHANGED: Use the pre-patched modules repository
       MODULES_REPO: https://github.com/redzrush101/android_kernel_xiaomi_sm8635-modules
       KERNEL_BRANCH: ${{ inputs.kernel_branch || 'lineage-23.2' }}
       MODULES_BRANCH: ${{ inputs.modules_branch || 'lineage-23.2' }}
@@ -68,13 +67,15 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update 
+          sudo apt-get update
           sudo apt-get install -y \
             bc bison flex build-essential libssl-dev libelf-dev dwarves cpio lz4 zstd \
-            kmod rsync python3 ccache git patch curl \
+            kmod rsync python3 ccache git patch curl wget \
+            lld llvm \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: Download Neutron-Clang
+        id: toolchain
         run: |
           set -euo pipefail
           mkdir -p "$WORK/toolchain"
@@ -86,41 +87,53 @@ jobs:
             -o antman
           chmod +x antman
 
+          # --noaxel is not a real antman flag in current releases; drop it.
           if [[ -n "${CLANG_VERSION:-}" ]]; then
             echo "Installing Neutron clang ${CLANG_VERSION} via AntMan..."
-            ./antman -S="${CLANG_VERSION}" --noconfirm --noaxel
+            ./antman -S="${CLANG_VERSION}" --noconfirm
           else
             echo "Installing latest Neutron clang via AntMan..."
-            ./antman -S --noconfirm --noaxel
+            ./antman -S --noconfirm
           fi
 
-          # AntMan extracts into ./neutron-clang by default
-          if [[ -x "$WORK/toolchain/neutron-clang/bin/clang" ]]; then
-            CLANG_BIN="$WORK/toolchain/neutron-clang/bin"
-          else
-            CLANG_BIN="$(dirname "$(find "$WORK/toolchain" -maxdepth 5 -name clang -print -quit)")"
-          fi
+          echo "== extracted tree (depth 3) =="
+          find "$WORK/toolchain" -maxdepth 3 | sort | head -60
+          echo "== clang binaries =="
+          find "$WORK/toolchain" -maxdepth 5 -type f -name clang -print
 
-          if [[ -z "${CLANG_BIN:-}" || ! -e "$CLANG_BIN/clang" ]]; then
+          # Locate the real clang executable, then derive its bin dir.
+          CLANG_BIN="$(dirname "$(find "$WORK/toolchain" -maxdepth 6 -type f -name clang -print -quit)")"
+          if [[ -z "${CLANG_BIN:-}" || "$CLANG_BIN" == "." || ! -x "$CLANG_BIN/clang" ]]; then
             echo "::error::Neutron clang binary not found after AntMan install"
-            find "$WORK/toolchain" -maxdepth 4 | head -40
+            find "$WORK/toolchain" -maxdepth 4 | head -60
             exit 1
           fi
+          CLANG_BIN="$(realpath "$CLANG_BIN")"
+
           echo "Neutron clang bin: $CLANG_BIN"
+          "$CLANG_BIN/clang" --version | head -1
+
+          # Expose to subsequent steps via both mechanisms.
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          echo "NEUTRON_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
 
       - name: Show toolchain
         run: |
-          clang --version
-          ld.lld --version
-          llvm-nm --version
+          # Explicit export — do not rely solely on $GITHUB_PATH.
+          export PATH="${NEUTRON_BIN:-}:$PATH"
+
+          echo "NEUTRON_BIN=$NEUTRON_BIN"
+          echo "PATH=$PATH"
+          clang --version | head -2
+          ld.lld --version | head -1
+          llvm-nm --version | head -1
           command -v clang ld.lld llvm-nm llvm-strip llvm-ar
 
           CLANG_PATH="$(command -v clang)"
           case "$CLANG_PATH" in
-            "$WORK/toolchain/"*) ;;
+            "${NEUTRON_BIN:-__none__}"/*) ;;
             *)
-              echo "::error::clang resolves to $CLANG_PATH, not the Neutron toolchain under $WORK/toolchain"
+              echo "::error::clang resolves to $CLANG_PATH, not the Neutron toolchain under ${NEUTRON_BIN:-<unset>}"
               exit 1
               ;;
           esac
@@ -138,11 +151,23 @@ jobs:
       - name: Clone kernel and patched modules
         run: |
           mkdir -p "$WORK" "$WORK/dist" "$WORK/logs"
-          git clone --depth=1 --branch "$KERNEL_BRANCH"  "$KERNEL_REPO"  "$KERNEL_DIR"
-          # CHANGED: Clone the pre-patched fork directly
-          git clone --depth=1 --branch "$MODULES_BRANCH" "$MODULES_REPO" "$MODULES_DIR"
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$KERNEL_DIR" \
+            2>&1 | tee "$WORK/logs/clone-kernel.log"
+          git clone --depth=1 --branch "$MODULES_BRANCH" "$MODULES_REPO" "$MODULES_DIR" \
+            2>&1 | tee "$WORK/logs/clone-modules.log"
+          git -C "$MODULES_DIR" log -1 --oneline | tee -a "$WORK/logs/clone-modules.log"
 
-      # REMOVED: "Apply patches" step is no longer needed.
+      - name: Verify patched driver is present in checkout
+        run: |
+          set -euo pipefail
+          F="$MODULES_DIR/qcom/opensource/wlan/qcacld-3.0/core/wma/src/wma_data.c"
+          grep -q 'wma_injection_tx' "$F" \
+            || { echo "::error::$F has no wma_injection_tx (unpatched fork / wrong branch)"; exit 1; }
+          if grep -Rn '^<<<<<<<\|^>>>>>>>' "$MODULES_DIR/qcom/opensource/wlan" 2>/dev/null; then
+            echo "::error::conflict markers present in wlan tree"
+            exit 1
+          fi
+          echo "Patched driver OK at $F"
 
       - name: Fix OpenSSL 3.0 undeclared 'key_pass' on Ubuntu 24.04 runners
         run: |
@@ -156,6 +181,9 @@ jobs:
         run: |
           cat > "$WORK/kmake" <<'EOF'
           #!/usr/bin/env bash
+          # Make sure the Neutron toolchain's bin is on PATH even if $GITHUB_PATH
+          # did not propagate (e.g. when kmake is invoked from another shell).
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           exec make -j"$(nproc)" -C "$KERNEL_DIR" O="$KERNEL_DIR/out" \
             ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CC="ccache clang" HOSTCC="ccache clang" \
@@ -166,6 +194,7 @@ jobs:
 
       - name: Configure kernel (gki + pineapple + peridot), module signing off
         run: |
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           cd "$KERNEL_DIR"
           CFG=arch/arm64/configs
 
@@ -204,10 +233,7 @@ jobs:
             -d MODULE_SIG -d MODULE_SIG_ALL -d MODULE_SIG_FORCE -d MODULE_SIG_PROTECT \
             -d LTO_NONE \
             -d LTO_CLANG_FULL \
-            -e LTO \
-            -e LTO_CLANG \
-            -e LTO_CLANG_THIN \
-            -e CFI_CLANG \
+            -e LTO -e LTO_CLANG -e LTO_CLANG_THIN -e CFI_CLANG \
             --set-str MODULE_SIG_KEY "" \
             --set-str SYSTEM_TRUSTED_KEYS "" \
             --set-str SYSTEM_REVOCATION_KEYS ""
@@ -222,6 +248,7 @@ jobs:
 
       - name: Build kernel (Image, Image.gz) + module prep
         run: |
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           "$WORK/kmake" Image Image.gz modules_prepare modules \
               2>&1 | tee "$WORK/logs/kernel-build.log"
 
@@ -243,6 +270,7 @@ jobs:
 
       - name: Build ${{ env.MODNAME }}.ko against this kernel
         run: |
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           WLAN="$MODULES_DIR/qcom/opensource/wlan"
           QCACLD="$WLAN/qcacld-3.0"
 
@@ -276,6 +304,7 @@ jobs:
 
       - name: Verify module (patch compiled in, unsigned, vermagic matches kernel)
         run: |
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           echo "== modinfo =="
           modinfo "$KO" | grep -E '^(name|vermagic|sig_id|signer):' || true
           SIG="$(modinfo -F sig_id "$KO" || true)"
@@ -287,7 +316,7 @@ jobs:
           COUNT="$(llvm-nm "$KO" | grep -c 'wma_injection' || true)"
           echo "wma_injection symbols: $COUNT"
           if [[ "$COUNT" -eq 0 ]]; then
-            echo "::error::FEATURE_FRAME_INJECTION_SUPPORT code is NOT in the module (patch/profile not picked up)"
+            echo "::error::FEATURE_FRAME_INJECTION_SUPPORT code is NOT in the module"
             exit 1
           fi
 
@@ -299,6 +328,7 @@ jobs:
 
       - name: Collect artifacts
         run: |
+          export PATH="${NEUTRON_BIN:-}:$PATH"
           D="$WORK/dist"
           cp "$KERNEL_DIR"/out/arch/arm64/boot/Image "$KERNEL_DIR"/out/arch/arm64/boot/Image.gz "$D/"
           cp "$KO" "$D/$MODNAME.ko"
