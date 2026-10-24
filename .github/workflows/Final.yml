@@ -27,7 +27,7 @@ jobs:
       DEFCONFIG_BASE: gki_defconfig
       # Config fragments, IN ORDER (later overrides earlier).
       # Leave a fragment out if it doesn't exist in your tree.
-      DEFCONFIG_FRAGMENTS: "vendor/pineapple_GKI.config vendor/xiaomi/pineapple_GKI.config"
+      DEFCONFIG_FRAGMENTS: "vendor/pineapple_GKI.config vendor/pineapple_GKI.config"
 
       # ---- qcacld (WLAN driver) defconfig -----------------------
       # Must match the file patched by 0001-sm8635-monitor.patch
