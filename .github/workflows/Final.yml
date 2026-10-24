@@ -21,17 +21,25 @@ jobs:
       LLVM: 1
       LLVM_IAS: 1
 
-      DEFCONFIG: vendor/waipio_defconfig
+      # ---- KERNEL CONFIG ----------------------------------------
+      # Base defconfig - usually gki_defconfig for kernel-common
+      # based Xiaomi/Qualcomm kernels (pineapple = SM8635)
+      DEFCONFIG_BASE: gki_defconfig
+      # Config fragments, IN ORDER (later overrides earlier).
+      # Leave a fragment out if it doesn't exist in your tree.
+      DEFCONFIG_FRAGMENTS: "vendor/pineapple_GKI.config vendor/xiaomi/pineapple_GKI.config"
+
+      # ---- qcacld (WLAN driver) defconfig -----------------------
+      # Must match the file patched by 0001-sm8635-monitor.patch
       WLAN_DEFCONFIG: pineapple_gki_qca6750_defconfig
 
-      # ccache
-      CCACHE_DIR:    ${{ github.workspace }}/.ccache
+      # ---- caching ---------------------------------------------
+      CCACHE_DIR:     ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 5G
-      # toolchain cache version - bump to force re-download
       TCACHE_VERSION: v1
 
     steps:
-      # 1. Kernel -----------------------------------------------------
+      # 1. Kernel ---------------------------------------------------
       - name: Checkout LineageOS kernel
         uses: actions/checkout@v4
         with:
@@ -39,7 +47,7 @@ jobs:
           path: kernel
           fetch-depth: 1
 
-      # 2. Patched modules repo --------------------------------------
+      # 2. Patched modules -----------------------------------------
       - name: Checkout patched modules repo
         uses: actions/checkout@v4
         with:
@@ -47,21 +55,39 @@ jobs:
           path: modules
           fetch-depth: 1
 
-      # 3. Verify monitor/injection patch present --------------------
-      - name: Verify monitor/injection patch present
+      # 3. Verify patch + config files ----------------------------
+      - name: Verify patch and config files present
         run: |
-          if grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
+          set -e
+          if ! grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
                "$MODULES_DIR/qcom/opensource/wlan/qcacld-3.0/Kbuild"; then
-            echo "OK: monitor/injection patch present"
-          else
-            echo "ERROR: module repo missing monitor/injection patch"
-            exit 1
+            echo "ERROR: module repo missing monitor/injection patch"; exit 1
           fi
+          if ! grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
+               "$MODULES_DIR/qcom/opensource/wlan/qcacld-3.0/configs/$WLAN_DEFCONFIG"; then
+            echo "ERROR: $WLAN_DEFCONFIG missing FRAME_INJECTION support"; exit 1
+          fi
+          echo "OK: patch present"
 
-      # 4. Dependencies ----------------------------------------------
+          echo "Looking for base and fragment files in kernel tree..."
+          # Base can be *_defconfig OR any existing defconfig
+          if [ -f "$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG_BASE" ]; then
+            echo "  base: arch/arm64/configs/$DEFCONFIG_BASE"
+          else
+            echo "  WARNING: arch/arm64/configs/$DEFCONFIG_BASE not found"
+          fi
+          for frag in $DEFCONFIG_FRAGMENTS; do
+            if [ -f "$KERNEL_DIR/arch/arm64/configs/$frag" ]; then
+              echo "  fragment: arch/arm64/configs/$frag"
+            else
+              echo "  ERROR: fragment not found: arch/arm64/configs/$frag"; exit 1
+            fi
+          done
+
+      # 4. Dependencies (fixed for Ubuntu 22.04/24.04) ------------
       - name: Install dependencies
         run: |
-          sudo dpkg --add-architecture i386   # Enable 32-bit packages
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex \
@@ -74,11 +100,8 @@ jobs:
             libssl-dev libxml2 libxml2-utils lzop pngcrush \
             rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
 
-      # ==============================================================
-      # CACHE LAYER
-      # ==============================================================
-      # 5a. Restore Neutron Clang toolchain cache (avoids antman download)
-      - name: Restore Neutron Clang toolchain
+      # 5a. Toolchain cache restore -------------------------------
+      - name: Restore Neutron Clang
         id: tc-restore
         uses: actions/cache/restore@v4
         with:
@@ -87,7 +110,7 @@ jobs:
           restore-keys: |
             neutron-clang-${{ runner.os }}-${{ env.TCACHE_VERSION }}-
 
-      # 5b. Download only if cache miss
+      # 5b. Download only on cache miss ---------------------------
       - name: Fetch Neutron Clang (cache miss)
         if: steps.tc-restore.outputs.cache-hit != 'true'
         run: |
@@ -98,41 +121,35 @@ jobs:
           ./antman -S
           ./antman --patch=glibc
 
-      # 5c. Save toolchain cache if it was freshly downloaded
-      - name: Save Neutron Clang toolchain
+      # 5c. Save toolchain cache ---------------------------------
+      - name: Save Neutron Clang
         if: steps.tc-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.TOOLCHAIN_DIR }}
           key: neutron-clang-${{ runner.os }}-${{ env.TCACHE_VERSION }}-${{ github.run_id }}
 
-      # Make toolchain visible to the rest of the job
       - name: Add toolchain to PATH
         run: echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
 
-      # 6. Restore ccache --------------------------------------------
+      # 6. ccache restore -----------------------------------------
       - name: Restore ccache
-        id: ccache-restore
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ env.DEFCONFIG }}-
+            ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-
 
-      # ==============================================================
-      # BUILD
-      # ==============================================================
-      # 7. Drop patched WLAN source into kernel tree -----------------
-      - name: Integrate patched WLAN source
+      # 7. Integrate patched WLAN source --------------------------
+      - name: Integrate patched WLAN source into kernel tree
         run: |
           set -e
           KWLAN="$KERNEL_DIR/qcom/opensource/wlan"
           MWLAN="$MODULES_DIR/qcom/opensource/wlan"
 
           if [ -d "$KWLAN/qcacld-3.0" ]; then
-            rm -rf "$KWLAN"
-            cp -a "$MWLAN" "$KWLAN"
+            rm -rf "$KWLAN"; cp -a "$MWLAN" "$KWLAN"
           elif [ -L "$KERNEL_DIR/drivers/staging/qcacld-3.0" ]; then
             T1=$(readlink -f "$KERNEL_DIR/drivers/staging/qcacld-3.0")
             T2=$(readlink -f "$KERNEL_DIR/drivers/staging/qca-wifi-host-cmn")
@@ -154,18 +171,24 @@ jobs:
             ln -sfn ../../qcom/opensource/wlan/qca-wifi-host-cmn \
                     "$KERNEL_DIR/drivers/staging/qca-wifi-host-cmn"
           fi
-
           if ! grep -q "qcacld-3.0" "$KERNEL_DIR/drivers/staging/Makefile" 2>/dev/null; then
             echo 'obj-$(CONFIG_QCA_CLD_WLAN) += qcacld-3.0/' \
               >> "$KERNEL_DIR/drivers/staging/Makefile"
           fi
 
-      # 8. Configure -------------------------------------------------
+      # 8. Kernel config: base + fragments + overrides ------------
       - name: Configure kernel
         run: |
+          set -e
           cd "$KERNEL_DIR"
-          make O=out ARCH=$ARCH $DEFCONFIG
 
+          echo "== Base: $DEFCONFIG_BASE =="
+          make O=out ARCH=$ARCH $DEFCONFIG_BASE
+
+          echo "== Merging fragments: $DEFCONFIG_FRAGMENTS =="
+          make O=out ARCH=$ARCH $DEFCONFIG_FRAGMENTS
+
+          echo "== Overrides (no module signing, ThinLTO, WLAN=m) =="
           scripts/config --file out/.config -d MODULE_SIG
           scripts/config --file out/.config -d MODULE_SIG_ALL
           scripts/config --file out/.config -d MODULE_SIG_FORCE
@@ -179,7 +202,11 @@ jobs:
 
           make O=out ARCH=$ARCH olddefconfig
 
-      # 9. Kernel image ----------------------------------------------
+          echo "== Verify key configs =="
+          grep -E "CONFIG_(ARM64|QCA_CLD_WLAN|LTO_CLANG_THIN|MODULE_SIG)" \
+              out/.config | sort || true
+
+      # 9. Kernel image -------------------------------------------
       - name: Build kernel image
         run: |
           cd "$KERNEL_DIR"
@@ -191,7 +218,7 @@ jobs:
             USE_CCACHE=1 CCACHE_EXEC=$(which ccache) \
             Image
 
-      # 10. Modules --------------------------------------------------
+      # 10. Modules (produces qca_cld3_qca6750.ko) ----------------
       - name: Build WLAN modules
         run: |
           cd "$KERNEL_DIR"
@@ -204,7 +231,7 @@ jobs:
             WLAN_DEFCONFIG=$WLAN_DEFCONFIG \
             modules
 
-      # 11. Verify ---------------------------------------------------
+      # 11. Verify -------------------------------------------------
       - name: Locate qca_cld3_qca6750.ko
         run: |
           FOUND=$(find "$KERNEL_DIR/out" -name "qca_cld3_qca6750.ko" -type f)
@@ -215,19 +242,15 @@ jobs:
           fi
           echo "Found:"; echo "$FOUND"
 
-      # ==============================================================
-      # SAVE CACHES
-      # ==============================================================
-      # 12. Save ccache (always runs, keyed by SHA so a new commit
-      #     writes a fresh entry; old entries are cleaned up by GH)
+      # 12. Save ccache -------------------------------------------
       - name: Save ccache
         if: github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}
 
-      # 13. Upload ---------------------------------------------------
+      # 13. Upload ------------------------------------------------
       - name: Upload qca_cld3_qca6750.ko
         uses: actions/upload-artifact@v4
         with:
