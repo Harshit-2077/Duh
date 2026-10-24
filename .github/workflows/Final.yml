@@ -85,21 +85,37 @@ jobs:
           fi
           echo "OK: $MATCHED fragment(s) detected"
 
-      # 4. Dependencies (fixed for Ubuntu 22.04/24.04) ------------
+      # 4. Dependencies (Ubuntu 24.04 verified) ------------------
       - name: Install dependencies
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex \
-            gcc-multilib g++-multilib \
-            git gnupg gperf imagemagick \
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio \
+            curl dwarves flex \
+            g++-multilib gawk gcc-multilib \
+            git git-lfs gnupg gperf \
+            imagemagick kmod \
             lib32z1-dev libc6-dev-i386 \
-            lib32ncurses6 lib32tinfo6 \
             libelf-dev liblz4-tool \
-            libncurses5-dev libncursesw5-dev libsdl1.2-dev \
-            libssl-dev libxml2 libxml2-utils lzop pngcrush \
-            rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+            libncurses-dev libncurses5-dev libncursesw5-dev \
+            libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush \
+            python3 python-is-python3 \
+            rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev zstd \
+            openssl ca-certificates
+
+      # 4b. Sanity: pahole must be available for BTF --------------
+      - name: Verify pahole (BTF generator)
+        run: |
+          if ! command -v pahole >/dev/null 2>&1; then
+            echo "::error::pahole not found (dwarves did not install correctly)"
+            dpkg -L dwarves 2>/dev/null | grep -E 'pahole|bin/' || true
+            exit 1
+          fi
+          echo "pahole: $(command -v pahole)"
+          pahole --version
 
       # 5a. Toolchain cache restore -------------------------------
       - name: Restore Neutron Clang
@@ -215,19 +231,26 @@ jobs:
           make O=out ARCH=$ARCH $FRAGMENTS
 
           echo "== Overrides =="
+          # no module signatures
           scripts/config --file out/.config -d MODULE_SIG
           scripts/config --file out/.config -d MODULE_SIG_ALL
           scripts/config --file out/.config -d MODULE_SIG_FORCE
+          # ThinLTO
           scripts/config --file out/.config -e LTO_CLANG
           scripts/config --file out/.config -e LTO_CLANG_THIN
           scripts/config --file out/.config -d LTO_NONE
+          # BTF disabled (CI-safe with LTO; .ko doesn't need it)
+          scripts/config --file out/.config -d DEBUG_INFO_BTF
+          scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES
+          # build WLAN as module
           scripts/config --file out/.config -m QCA_CLD_WLAN
+          # ccache
           scripts/config --file out/.config -e CCACHE
 
           make O=out ARCH=$ARCH olddefconfig
 
           echo "== Verify =="
-          grep -E "CONFIG_(ARM64|QCA_CLD_WLAN|LTO_CLANG_THIN|MODULE_SIG)" \
+          grep -E "CONFIG_(ARM64|QCA_CLD_WLAN|LTO_CLANG_THIN|MODULE_SIG|DEBUG_INFO_BTF)" \
               out/.config | sort || true
 
       # 10. Kernel image ------------------------------------------
