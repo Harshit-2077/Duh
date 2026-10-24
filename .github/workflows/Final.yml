@@ -21,16 +21,19 @@ jobs:
       LLVM: 1
       LLVM_IAS: 1
 
+      # ---- KERNEL CONFIG ---------------------------------------
       DEFCONFIG_BASE: gki_defconfig
       DEFCONFIG_FRAGMENTS_GLOB: "vendor/peridot_GKI.config vendor/pineapple_GKI.config"
       WLAN_DEFCONFIG: pineapple_gki_qca6750_defconfig
 
+      # ---- caching --------------------------------------------
       CCACHE_DIR:     ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 5G
-      TCACHE_VERSION: v1
+      # Bumped to v2 to discard the corrupted cache causing EOF errors
+      TCACHE_VERSION: v2
 
     steps:
-      # 1. Kernel
+      # 1. Kernel ---------------------------------------------------
       - name: Checkout LineageOS kernel
         uses: actions/checkout@v4
         with:
@@ -38,7 +41,7 @@ jobs:
           path: kernel
           fetch-depth: 1
 
-      # 2. Modules
+      # 2. Patched modules -----------------------------------------
       - name: Checkout patched modules repo
         uses: actions/checkout@v4
         with:
@@ -46,22 +49,22 @@ jobs:
           path: modules
           fetch-depth: 1
 
-      # 3. Verify patches/configs exist
+      # 3. Verify patches and configs ------------------------------
       - name: Verify patch and config files
         run: |
           set -e
           if ! grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
                "$MODULES_DIR/qcom/opensource/wlan/qcacld-3.0/Kbuild"; then
-            echo "ERROR: module repo missing monitor/injection patch"; exit 1
+            echo "::error::module repo missing monitor/injection patch"; exit 1
           fi
           if ! grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
                "$MODULES_DIR/qcom/opensource/wlan/qcacld-3.0/configs/$WLAN_DEFCONFIG"; then
-            echo "ERROR: $WLAN_DEFCONFIG missing FRAME_INJECTION support"; exit 1
+            echo "::error::$WLAN_DEFCONFIG missing FRAME_INJECTION support"; exit 1
           fi
           echo "OK: patch present"
 
           if [ ! -f "$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG_BASE" ]; then
-            echo "ERROR: base defconfig missing: arch/arm64/configs/$DEFCONFIG_BASE"
+            echo "::error::base defconfig missing: arch/arm64/configs/$DEFCONFIG_BASE"
             exit 1
           fi
 
@@ -74,11 +77,11 @@ jobs:
             done
           done
           if [ "$MATCHED" -eq 0 ]; then
-            echo "ERROR: no fragments matched: $DEFCONFIG_FRAGMENTS_GLOB"; exit 1
+            echo "::error::no fragments matched: $DEFCONFIG_FRAGMENTS_GLOB"; exit 1
           fi
           echo "OK: $MATCHED fragment(s) detected"
 
-      # 4. Dependencies (Ubuntu 24.04 verified)
+      # 4. Dependencies (Ubuntu 24.04 verified) -------------------
       - name: Install dependencies
         run: |
           sudo dpkg --add-architecture i386
@@ -106,7 +109,7 @@ jobs:
           fi
           echo "pahole: $(command -v pahole)"; pahole --version
 
-      # 5a-c. Toolchain cache (restore/download/save)
+      # 5. Toolchain cache ----------------------------------------
       - name: Restore Neutron Clang
         id: tc-restore
         uses: actions/cache/restore@v4
@@ -135,17 +138,17 @@ jobs:
       - name: Add toolchain to PATH
         run: echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
 
-      # 6. ccache restore
+      # 6. ccache restore -----------------------------------------
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-m
+          key: ccache-v2-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-m
           restore-keys: |
-            ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-
-            ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-
+            ccache-v2-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-
+            ccache-v2-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-
 
-      # 7. Integrate patched WLAN + wire up Kconfig + Makefile
+      # 7. Integrate WLAN + Kconfig + Makefile --------------------
       - name: Integrate patched WLAN source
         run: |
           set -e
@@ -177,43 +180,20 @@ jobs:
                     "$KERNEL_DIR/drivers/staging/qca-wifi-host-cmn"
           fi
 
-          # *** THE FIX ***
           STAGING_KCONFIG="$KERNEL_DIR/drivers/staging/Kconfig"
-          if [ ! -f "$STAGING_KCONFIG" ]; then
-            echo "ERROR: $STAGING_KCONFIG not found"; exit 1
-          fi
           if ! grep -q 'qcacld-3.0/Kconfig' "$STAGING_KCONFIG"; then
             echo '' >> "$STAGING_KCONFIG"
             echo 'source "drivers/staging/qcacld-3.0/Kconfig"' >> "$STAGING_KCONFIG"
             echo "Added Kconfig source"
-          else
-            echo "Kconfig source already present"
           fi
 
           STAGING_MAKEFILE="$KERNEL_DIR/drivers/staging/Makefile"
-          if [ ! -f "$STAGING_MAKEFILE" ]; then
-            echo "ERROR: $STAGING_MAKEFILE not found"; exit 1
-          fi
           if ! grep -q 'qcacld-3.0/' "$STAGING_MAKEFILE"; then
             echo 'obj-$(CONFIG_QCA_CLD_WLAN) += qcacld-3.0/' >> "$STAGING_MAKEFILE"
             echo "Added Makefile entry"
-          else
-            echo "Makefile entry already present"
           fi
 
-          if [ ! -f "$KERNEL_DIR/drivers/staging/qcacld-3.0/Kbuild" ]; then
-            echo "ERROR: qcacld-3.0/Kbuild not found"; exit 1
-          fi
-          if ! grep -q "FEATURE_FRAME_INJECTION_SUPPORT" \
-               "$KERNEL_DIR/drivers/staging/qcacld-3.0/Kbuild"; then
-            echo "ERROR: patched Kbuild not in place"; exit 1
-          fi
-          if [ ! -f "$KERNEL_DIR/drivers/staging/qcacld-3.0/configs/$WLAN_DEFCONFIG" ]; then
-            echo "ERROR: WLAN defconfig missing: $WLAN_DEFCONFIG"; exit 1
-          fi
-          echo "OK: qcacld integrated + Kconfig + Makefile wired"
-
-      # 8. OpenSSL 3.0 key_pass fix
+      # 8. OpenSSL 3.0 key_pass fix -------------------------------
       - name: Patch OpenSSL 3.0 key_pass issue
         run: |
           ROOT="$KERNEL_DIR"
@@ -222,17 +202,14 @@ jobs:
             sed -i '1i __attribute__((unused)) static const char *key_pass;' \
                   "$ROOT/certs/extract-cert.c"
             echo "Patched certs/extract-cert.c"
-          else
-            echo "certs/extract-cert.c not present, skipping"
           fi
 
-      # 9. Configure kernel
+      # 9. Configure kernel ---------------------------------------
       - name: Configure kernel
         run: |
           set -e
           cd "$KERNEL_DIR"
 
-          echo "== Base: $DEFCONFIG_BASE =="
           make O=out ARCH=$ARCH $DEFCONFIG_BASE
 
           FRAGMENTS=""
@@ -243,13 +220,8 @@ jobs:
               FRAGMENTS="$FRAGMENTS $rel"
             done
           done
-          if [ -z "$FRAGMENTS" ]; then
-            echo "ERROR: no fragments matched"; exit 1
-          fi
-          echo "== Fragments:$FRAGMENTS =="
           make O=out ARCH=$ARCH $FRAGMENTS
 
-          echo "== Overrides =="
           scripts/config --file out/.config -d MODULE_SIG
           scripts/config --file out/.config -d MODULE_SIG_ALL
           scripts/config --file out/.config -d MODULE_SIG_FORCE
@@ -263,60 +235,47 @@ jobs:
 
           make O=out ARCH=$ARCH olddefconfig
 
-          echo "== Verify =="
-          grep -E "CONFIG_(ARM64|QCA_CLD_WLAN|LTO_CLANG_THIN|MODULE_SIG|DEBUG_INFO_BTF)" \
-              out/.config | sort || true
-
-      # 9b. Hard verify QCA_CLD_WLAN=m survived olddefconfig
-      - name: Verify QCA_CLD_WLAN=m in final config
-        run: |
-          set -e
-          CFG="$KERNEL_DIR/out/.config"
-          if ! grep -q "^CONFIG_QCA_CLD_WLAN=m$" "$CFG"; then
-            echo "::error::CONFIG_QCA_CLD_WLAN=m missing from $CFG"
-            echo "--- current QCA_CLD_WLAN ---"
-            grep "QCA_CLD_WLAN" "$CFG" || echo "(not present)"
-            echo "--- related WLAN/WIFI ---"
-            grep -iE "WLAN|WIFI" "$CFG" | head -30 || true
-            echo "--- qcacld Kconfig head ---"
-            head -30 "$KERNEL_DIR/drivers/staging/qcacld-3.0/Kconfig" || true
-            exit 1
+          if ! grep -q "^CONFIG_QCA_CLD_WLAN=m$" out/.config; then
+            echo "::error::CONFIG_QCA_CLD_WLAN=m missing"; exit 1
           fi
-          echo "OK: CONFIG_QCA_CLD_WLAN=m"
 
-      # 10. Build kernel image
+      # 10. Kernel image ------------------------------------------
       - name: Build kernel image
         run: |
+          ulimit -s unlimited
+          ulimit -n 4096
           cd "$KERNEL_DIR"
-          make -j$(nproc) O=out ARCH=$ARCH \
+          make -j4 O=out ARCH=$ARCH \
             CC=$CC CROSS_COMPILE=$CROSS_COMPILE \
             CROSS_COMPILE_COMPAT=$CROSS_COMPILE_COMPAT \
             LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
             USE_CCACHE=1 CCACHE_EXEC=$(which ccache) \
             Image
 
-      # 10b. ccache save (after kernel)
       - name: Save ccache (after kernel)
         if: success()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-k
+          key: ccache-v2-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-k
 
-      # 11. Build WLAN module
+      # 11. Build WLAN module (only qcacld) -----------------------
       - name: Build WLAN modules
         env:
           WLAN_DEFCONFIG: ${{ env.WLAN_DEFCONFIG }}
         run: |
           set -e
+          ulimit -s unlimited
+          ulimit -n 4096
           cd "$KERNEL_DIR"
           export WLAN_DEFCONFIG
-          make -j$(nproc) O=out ARCH=$ARCH \
+          make -j4 O=out ARCH=$ARCH \
             CC=$CC CROSS_COMPILE=$CROSS_COMPILE \
             CROSS_COMPILE_COMPAT=$CROSS_COMPILE_COMPAT \
             LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
             USE_CCACHE=1 CCACHE_EXEC=$(which ccache) \
             WLAN_DEFCONFIG=$WLAN_DEFCONFIG \
+            M=drivers/staging/qcacld-3.0 \
             modules
 
       # 11a. Debug listing
@@ -325,34 +284,27 @@ jobs:
         run: |
           echo "=== qca_cld3*.ko ==="
           find "$KERNEL_DIR/out" -name "qca_cld3*.ko" -type f 2>/dev/null || true
-          echo "=== wlan*.ko ==="
-          find "$KERNEL_DIR/out" -name "wlan*.ko" -type f 2>/dev/null || true
           echo "=== out/drivers/staging/qcacld-3.0/ ==="
           ls -la "$KERNEL_DIR/out/drivers/staging/qcacld-3.0/" 2>/dev/null || echo "(not present)"
-          echo "=== out/qcom/opensource/wlan/qcacld-3.0/ ==="
-          ls -la "$KERNEL_DIR/out/qcom/opensource/wlan/qcacld-3.0/" 2>/dev/null || echo "(not present)"
 
-      # 11b. ccache save (after modules)
       - name: Save ccache (after modules)
         if: success()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-m
+          key: ccache-v2-${{ runner.os }}-${{ env.DEFCONFIG_BASE }}-${{ github.sha }}-r${{ github.run_id }}a${{ github.run_attempt }}-m
 
-      # 12. Locate the target .ko
+      # 12. Locate the target .ko ---------------------------------
       - name: Locate qca_cld3_qca6750.ko
         run: |
           FOUND=$(find "$KERNEL_DIR/out" -name "qca_cld3_qca6750.ko" -type f)
           if [ -z "$FOUND" ]; then
             echo "::error::qca_cld3_qca6750.ko not produced"
-            echo "--- all qca_cld3*.ko ---"
-            find "$KERNEL_DIR/out" -name "qca_cld3*.ko" -type f || true
             exit 1
           fi
           echo "Found:"; echo "$FOUND"
 
-      # 13. Upload
+      # 13. Upload ------------------------------------------------
       - name: Upload qca_cld3_qca6750.ko
         uses: actions/upload-artifact@v4
         with:
