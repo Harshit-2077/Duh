@@ -78,66 +78,17 @@ jobs:
         id: toolchain
         run: |
           set -euo pipefail
-          mkdir -p "$WORK/toolchain"
-          cd "$WORK/toolchain"
-
-          echo "Fetching AntMan..."
-          curl -fsSL \
-            "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" \
-            -o antman
+          mkdir -p "$HOME/toolchains/neutron-clang"
+          cd "$HOME/toolchains/neutron-clang"
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
           chmod +x antman
-
-          # --noaxel is not a real antman flag in current releases; drop it.
-          if [[ -n "${CLANG_VERSION:-}" ]]; then
-            echo "Installing Neutron clang ${CLANG_VERSION} via AntMan..."
-            ./antman -S="${CLANG_VERSION}" --noconfirm
-          else
-            echo "Installing latest Neutron clang via AntMan..."
-            ./antman -S --noconfirm
-          fi
-
-          echo "== extracted tree (depth 3) =="
-          find "$WORK/toolchain" -maxdepth 3 | sort | head -60
-          echo "== clang binaries =="
-          find "$WORK/toolchain" -maxdepth 5 -type f -name clang -print
-
-          # Locate the real clang executable, then derive its bin dir.
-          CLANG_BIN="$(dirname "$(find "$WORK/toolchain" -maxdepth 6 -type f -name clang -print -quit)")"
-          if [[ -z "${CLANG_BIN:-}" || "$CLANG_BIN" == "." || ! -x "$CLANG_BIN/clang" ]]; then
-            echo "::error::Neutron clang binary not found after AntMan install"
-            find "$WORK/toolchain" -maxdepth 4 | head -60
-            exit 1
-          fi
-          CLANG_BIN="$(realpath "$CLANG_BIN")"
-
-          echo "Neutron clang bin: $CLANG_BIN"
-          "$CLANG_BIN/clang" --version | head -1
-
-          # Expose to subsequent steps via both mechanisms.
-          echo "$CLANG_BIN" >> "$GITHUB_PATH"
-          echo "NEUTRON_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
-
+          ./antman -S
+          ./antman --patch=glibc
+          echo "CLANG_DIR=$HOME/clang" >> "$GITHUB_ENV"
+          
       - name: Show toolchain
         run: |
-          # Explicit export — do not rely solely on $GITHUB_PATH.
-          export PATH="${NEUTRON_BIN:-}:$PATH"
-
-          echo "NEUTRON_BIN=$NEUTRON_BIN"
-          echo "PATH=$PATH"
-          clang --version | head -2
-          ld.lld --version | head -1
-          llvm-nm --version | head -1
-          command -v clang ld.lld llvm-nm llvm-strip llvm-ar
-
-          CLANG_PATH="$(command -v clang)"
-          case "$CLANG_PATH" in
-            "${NEUTRON_BIN:-__none__}"/*) ;;
-            *)
-              echo "::error::clang resolves to $CLANG_PATH, not the Neutron toolchain under ${NEUTRON_BIN:-<unset>}"
-              exit 1
-              ;;
-          esac
-          echo "clang from Neutron toolchain: $CLANG_PATH"
+          
 
       - name: Restore ccache
         uses: actions/cache@v4
